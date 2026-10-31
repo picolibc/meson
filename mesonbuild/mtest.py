@@ -13,6 +13,7 @@ import argparse
 import asyncio
 import datetime
 import enum
+import hashlib
 import json
 import os
 import pickle
@@ -178,6 +179,10 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
                         help='Maximum number of lines to show from a long test log. Since 1.5.0.')
     parser.add_argument('--slice', default=None, type=test_slice, metavar='SLICE/NUM_SLICES',
                         help='Split tests into NUM_SLICES slices and execute slice SLICE. Since 1.8.0.')
+    parser.add_argument('--hash-record', default=False, action='store_true',
+                        help='Record hashes of the selected tests in meson-private instead of running them.')
+    parser.add_argument('--hash-changed', default=False, action='store_true',
+                        help='Only run tests whose hash differs from the one recorded by --hash-record.')
     parser.add_argument('args', nargs='*',
                         help='Optional list of test names to run. "testname" to run all tests with that name, '
                         '"subprojname:testname" to specifically run "testname" from "subprojname", '
@@ -1925,6 +1930,14 @@ class TestHarness:
             # wrapper script.
             sys.exit(125)
 
+        if self.options.hash_record:
+            self.hash_record(tests)
+            return 0
+        if self.options.hash_changed:
+            tests = self.hash_changed_tests(tests)
+            if not tests:
+                return 0
+
         self.name_max_len = max(uniwidth(self.get_pretty_suite(test)) for test in tests)
         self.options.num_processes = min(self.options.num_processes,
                                          len(tests) * self.options.repeat)
@@ -1946,6 +1959,74 @@ class TestHarness:
         finally:
             os.chdir(startdir)
         return 1 if self.total_failure_count() > 0 else 0
+
+    HASH_FILE = 'meson_test_hashes.dat'
+
+    @staticmethod
+    def hash_key(test: TestSerialisation) -> str:
+        return f'{test.project_name}:{test.name}:{",".join(test.suite)}'
+
+    def test_hash(self, test: TestSerialisation, cache: T.Dict[str, str]) -> T.Optional[str]:
+        # Returns None for tests which don't run a built program, such
+        # as scripts from the source tree; --hash-changed always runs those.
+        # Otherwise, the hash covers the contents of every file
+        # named on the command line, including the program and any
+        # wrappers, along with the text of the remaining arguments.
+        if not test.cmd_is_built:
+            return None
+        cmd = self.get_wrapper(self.options)
+        if test.is_cross_built and test.needs_exe_wrapper and test.exe_wrapper:
+            cmd = cmd + test.exe_wrapper.get_command()
+        cmd = cmd + test.fname + test.cmd_args
+        h = hashlib.md5()
+        for arg in cmd:
+            path = os.path.join(self.options.wd, test.workdir or '', arg)
+            if os.path.isfile(path):
+                if path not in cache:
+                    fh = hashlib.md5()
+                    try:
+                        with open(path, 'rb') as f:
+                            while chunk := f.read(1 << 20):
+                                fh.update(chunk)
+                    except OSError:
+                        return None
+                    cache[path] = fh.hexdigest()
+                h.update(b'F' + cache[path].encode())
+            elif arg == test.fname[0]:
+                return None
+            else:
+                h.update(b'A' + arg.encode())
+            h.update(b'\0')
+        return h.hexdigest()
+
+    def hash_path(self) -> str:
+        return os.path.join(self.options.wd, 'meson-private', self.HASH_FILE)
+
+    def hash_record(self, tests: T.List[TestSerialisation]) -> None:
+        cache: T.Dict[str, str] = {}
+        hashes = {}
+        for test in tests:
+            test_hash = self.test_hash(test, cache)
+            if test_hash is not None:
+                hashes[self.hash_key(test)] = test_hash
+        with open(self.hash_path(), 'wb') as f:
+            pickle.dump(hashes, f)
+        print(f'Recorded hashes for {len(hashes)} of {len(tests)} tests.')
+
+    def hash_changed_tests(self, tests: T.List[TestSerialisation]) -> T.List[TestSerialisation]:
+        try:
+            with open(self.hash_path(), 'rb') as f:
+                saved = pickle.load(f)
+        except FileNotFoundError:
+            saved = {}
+        cache: T.Dict[str, str] = {}
+        changed = []
+        for test in tests:
+            test_hash = self.test_hash(test, cache)
+            if test_hash is None or saved.get(self.hash_key(test)) != test_hash:
+                changed.append(test)
+        print(f'{len(changed)} of {len(tests)} tests changed.')
+        return changed
 
     @staticmethod
     def split_suite_string(suite: str) -> T.Tuple[str, str]:
